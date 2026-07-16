@@ -1,0 +1,3 @@
+/data/summerint26/models/cpy/meter_detect/build_fixed/CMakeFiles/yolov8n.dir
+/data/summerint26/models/cpy/meter_detect/build_fixed/CMakeFiles/edit_cache.dir
+/data/summerint26/models/cpy/meter_detect/build_fixed/CMakeFiles/rebuild_cache.dir

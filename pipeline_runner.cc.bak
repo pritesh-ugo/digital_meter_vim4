@@ -1,0 +1,248 @@
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <fstream>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <glob.h>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <vector>
+
+#include <opencv2/opencv.hpp>
+
+namespace {
+
+const std::string kRootDir = "/data/summerint26/models/cpy";
+const std::string kMeterDetectDir = kRootDir + "/meter_detect";
+const std::string kMeterCropDir = kRootDir + "/meter_crop";
+const std::string kOcrDir = kRootDir + "/onnx_output";
+const std::string kMeterDetectBuildDir = kMeterDetectDir + "/build_fixed";
+const std::string kMeterCropBuildDir = kMeterCropDir + "/build_fixed";
+
+const std::string kPipelineDebugDir = kRootDir + "/pipeline_debug";
+const std::string kPipelineResultsDir = kRootDir + "/pipeline_results";
+const std::string kPipelineStageDebugDir = kPipelineDebugDir + "/stages";
+
+std::string shell_quote(const std::string &value) {
+    std::string quoted = "'";
+    for (char ch : value) {
+        if (ch == '\'') {
+            quoted += "'\\''";
+        } else {
+            quoted += ch;
+        }
+    }
+    quoted += "'";
+    return quoted;
+}
+
+void ensure_dir(const std::string &path) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) {
+        mkdir(path.c_str(), 0755);
+    }
+}
+
+void ensure_output_dirs() {
+    ensure_dir(kPipelineDebugDir);
+    ensure_dir(kPipelineResultsDir);
+    ensure_dir(kPipelineStageDebugDir);
+}
+
+bool file_exists(const std::string &path) {
+    return access(path.c_str(), F_OK) == 0;
+}
+
+std::string resolve_absolute_path(const std::string &path) {
+    char resolved[PATH_MAX];
+    if (realpath(path.c_str(), resolved) != nullptr) {
+        return std::string(resolved);
+    }
+    return path;
+}
+
+std::vector<std::string> glob_files(const std::string &pattern) {
+    glob_t results;
+    std::vector<std::string> files;
+    if (glob(pattern.c_str(), 0, nullptr, &results) == 0) {
+        for (size_t i = 0; i < results.gl_pathc; ++i) {
+            files.emplace_back(results.gl_pathv[i]);
+        }
+        std::sort(files.begin(), files.end());
+    }
+    globfree(&results);
+    return files;
+}
+
+cv::Mat letterbox(const cv::Mat &image, int target_width, int target_height, cv::Scalar pad_color) {
+    if (image.empty()) {
+        return cv::Mat();
+    }
+
+    double scale = std::min(
+        static_cast<double>(target_width) / static_cast<double>(image.cols),
+        static_cast<double>(target_height) / static_cast<double>(image.rows));
+
+    int resized_width = std::max(1, static_cast<int>(std::round(image.cols * scale)));
+    int resized_height = std::max(1, static_cast<int>(std::round(image.rows * scale)));
+
+    cv::Mat resized;
+    cv::resize(image, resized, cv::Size(resized_width, resized_height), 0, 0, cv::INTER_LINEAR);
+
+    cv::Mat boxed(target_height, target_width, image.type(), pad_color);
+    int pad_x = (target_width - resized_width) / 2;
+    int pad_y = (target_height - resized_height) / 2;
+    resized.copyTo(boxed(cv::Rect(pad_x, pad_y, resized_width, resized_height)));
+    return boxed;
+}
+
+bool save_letterboxed_image(const std::string &input_path,
+                            const std::string &output_path,
+                            int width,
+                            int height) {
+    cv::Mat image = cv::imread(input_path);
+    if (image.empty()) {
+        return false;
+    }
+
+    cv::Mat boxed = letterbox(image, width, height, cv::Scalar(114, 114, 114));
+    if (boxed.empty()) {
+        return false;
+    }
+
+    return cv::imwrite(output_path, boxed);
+}
+
+double run_command(const std::string &command) {
+    auto start = std::chrono::high_resolution_clock::now();
+    int ret = std::system(command.c_str());
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> elapsed = end - start;
+
+    if (ret != 0) {
+        std::cout << "Command failed (exit " << ret << "): " << command << std::endl;
+    }
+
+    return elapsed.count();
+}
+
+void print_stage_time(const std::string &stage_name, double preprocess_ms, double inference_ms, double postprocess_ms) {
+    std::cout << "\n================ " << stage_name << " ================\n";
+    std::cout << "Pre-process Time       : " << preprocess_ms << " ms\n";
+    std::cout << "Inference Time         : " << inference_ms << " ms\n";
+    std::cout << "Post-process Time      : " << postprocess_ms << " ms\n";
+    std::cout << "==================================================\n";
+}
+
+} // namespace
+
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " <input_image>" << std::endl;
+        return 1;
+    }
+
+    const std::string input_image = resolve_absolute_path(argv[1]);
+    if (!file_exists(input_image)) {
+        std::cerr << "Input image not found: " << argv[1] << std::endl;
+        return 1;
+    }
+
+    ensure_output_dirs();
+
+    const std::string pipeline_input_640 = kPipelineDebugDir + "/meter_detect_input_640x640.jpg";
+    const std::string pipeline_meter_crop_640 = kPipelineDebugDir + "/meter_crop_input_640x640.jpg";
+    const std::string pipeline_ocr_input_320x48 = kPipelineDebugDir + "/ocr_input_320x48.jpg";
+
+    auto stage_start = std::chrono::high_resolution_clock::now();
+    if (!save_letterboxed_image(input_image, pipeline_input_640, 640, 640)) {
+        std::cerr << "Failed to create 640x640 detector preview" << std::endl;
+        return 1;
+    }
+    auto stage_end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> detector_pre_ms = stage_end - stage_start;
+
+    std::string detector_cmd = "cd " + shell_quote(kMeterDetectBuildDir) +
+                               " && ./yolov8n -m ../data/best_int8.adla -p " + shell_quote(input_image);
+    double detector_infer_ms = run_command(detector_cmd);
+
+    std::vector<std::string> meter_crops = glob_files(kMeterDetectDir + "/debug/meter_crop_*.jpg");
+    if (meter_crops.empty()) {
+        std::cerr << "No meter crop was produced by meter_detect" << std::endl;
+        return 1;
+    }
+
+    const std::string selected_meter_crop = meter_crops.front();
+    if (!save_letterboxed_image(selected_meter_crop, pipeline_meter_crop_640, 640, 640)) {
+        std::cerr << "Failed to create 640x640 crop preview" << std::endl;
+        return 1;
+    }
+
+    auto crop_stage_start = std::chrono::high_resolution_clock::now();
+    std::string crop_cmd = "cd " + shell_quote(kMeterCropBuildDir) +
+                           " && ./yolov8n -m ../data/best_int8.adla -p " + shell_quote(pipeline_meter_crop_640);
+    double crop_infer_ms = run_command(crop_cmd);
+    auto crop_stage_end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> crop_post_ms = crop_stage_end - crop_stage_start;
+
+    std::vector<std::string> text_crops = glob_files(kMeterCropDir + "/debug/text_crop_*.jpg");
+    if (text_crops.empty()) {
+        std::cerr << "No text crop was produced by meter_crop" << std::endl;
+        return 1;
+    }
+
+    std::ostringstream final_text_stream;
+    for (size_t i = 0; i < text_crops.size(); ++i) {
+        std::ostringstream boxed_name;
+        boxed_name << kPipelineDebugDir << "/ocr_input_" << i << "_320x48.jpg";
+        if (!save_letterboxed_image(text_crops[i], boxed_name.str(), 320, 48)) {
+            std::cerr << "Failed to create OCR input for: " << text_crops[i] << std::endl;
+            continue;
+        }
+
+        std::string ocr_cmd = "cd " + shell_quote(kOcrDir) + " && python3 x.py " + shell_quote(boxed_name.str());
+        double ocr_ms = run_command(ocr_cmd);
+
+        std::string result_file = kOcrDir + "/results/ocr_result.txt";
+        if (file_exists(result_file)) {
+            std::ifstream result_stream(result_file);
+            std::string line;
+            if (std::getline(result_stream, line)) {
+                if (!line.empty()) {
+                    if (i > 0) {
+                        final_text_stream << ' ';
+                    }
+                    final_text_stream << line;
+                }
+            }
+        }
+
+        std::cout << "OCR crop " << i << " wall time: " << ocr_ms << " ms" << std::endl;
+    }
+
+    cv::Mat detector_preview = cv::imread(pipeline_input_640);
+    if (!detector_preview.empty()) {
+        cv::imwrite(kPipelineResultsDir + "/detector_input_640x640.jpg", detector_preview);
+    }
+
+    cv::Mat crop_preview = cv::imread(pipeline_meter_crop_640);
+    if (!crop_preview.empty()) {
+        cv::imwrite(kPipelineResultsDir + "/meter_crop_input_640x640.jpg", crop_preview);
+    }
+
+    std::ofstream pipeline_result(kPipelineResultsDir + "/final_reading.txt");
+    pipeline_result << final_text_stream.str() << std::endl;
+    pipeline_result.close();
+
+    print_stage_time("PIPELINE", detector_pre_ms.count(), detector_infer_ms, crop_post_ms.count());
+    std::cout << "Final assembled reading: " << final_text_stream.str() << std::endl;
+    std::cout << "Results written to: " << kPipelineResultsDir << std::endl;
+
+    return 0;
+}

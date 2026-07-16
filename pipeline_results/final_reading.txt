@@ -1,0 +1,3 @@
+OCR crop 1: 27
+OCR crop 2: 57
+Combined reading: 2757

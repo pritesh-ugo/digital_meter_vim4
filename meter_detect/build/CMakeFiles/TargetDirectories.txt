@@ -1,0 +1,3 @@
+/data/summerint26/vim4_npu_applications/yolov8n/build/CMakeFiles/yolov8n.dir
+/data/summerint26/vim4_npu_applications/yolov8n/build/CMakeFiles/edit_cache.dir
+/data/summerint26/vim4_npu_applications/yolov8n/build/CMakeFiles/rebuild_cache.dir
