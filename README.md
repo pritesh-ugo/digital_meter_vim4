@@ -159,7 +159,7 @@ Both models have identical input/output shapes (`input: 1×48×320×3 FLOAT`, `o
 ### Prerequisites
 - OpenCV 4 headers: `/usr/include/opencv4`
 - OpenCV 4 libraries: `/usr/lib/aarch64-linux-gnu/`
-- Python venv with `cv2`, `numpy`, `ksnn`: `/data/summerint26/venv/`
+- Python venv with `cv2`, `numpy`, `ksnn`:build from source.
 - AML NNSDK libraries (already linked in `meter_detect` and `meter_crop` builds)
 
 ### Compile the Pipeline Runner
